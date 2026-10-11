@@ -34,6 +34,7 @@
 #include <fcntl.h>
 #include <linux/input.h>
 #include <stdio.h>
+#include <winpr/string.h>
 
 #include "rdp.h"
 
@@ -195,10 +196,7 @@ clipboard_process_text_utf8(struct rdp_clipboard_data_source *source, bool is_se
 
 	if (is_send) {
 		char *data = source->data_contents.data;
-#if FREERDP_VERSION_MAJOR >= 3
-		/* WinPR's Convert*N functions return SSIZE_T (-1 on error) */
-		SSIZE_T data_size, data_size_in_char;
-#else
+#if FREERDP_VERSION_MAJOR < 3
 		size_t data_size, data_size_in_char;
 #endif
 
@@ -208,38 +206,61 @@ clipboard_process_text_utf8(struct rdp_clipboard_data_source *source, bool is_se
 		data[source->data_contents.size] = '\0';
 		source->data_contents.size++;
 
-		/* obtain size in UNICODE */
 #if FREERDP_VERSION_MAJOR >= 3
-		data_size = ConvertUtf8NToWChar(data,
-						source->data_contents.size,
-						NULL, 0);
+		/* WinPR reports content units, excluding the final WCHAR. */
+		size_t units = 0;
+		WCHAR *wide = ConvertUtf8NToWCharAlloc(data,
+						source->data_contents.size, &units);
+		if (!wide || !units) {
+			free(wide);
+			goto error_return;
+		}
+		/* CF_UNICODETEXT requires CR-LF. Preserve leading and final lines,
+		 * and do not duplicate an existing CR-LF pair. */
+		size_t wire_units = 1;
+		for (size_t i = 0; i < units; i++) {
+			if (wide[i] == L'\r' || wide[i] == L'\n') {
+				wire_units += 2;
+				if (wide[i] == L'\r' && i + 1 < units && wide[i + 1] == L'\n')
+					i++;
+			} else {
+				wire_units++;
+			}
+		}
+		if (wire_units > UINT32_MAX / sizeof(WCHAR) ||
+		    !wl_array_add(&data_contents, wire_units * sizeof(WCHAR))) {
+			free(wide);
+			goto error_return;
+		}
+		WCHAR *wire = data_contents.data;
+		size_t out = 0;
+		for (size_t i = 0; i < units; i++) {
+			if (wide[i] == L'\r' || wide[i] == L'\n') {
+				wire[out++] = L'\r';
+				wire[out++] = L'\n';
+				if (wide[i] == L'\r' && i + 1 < units && wide[i + 1] == L'\n')
+					i++;
+			} else {
+				wire[out++] = wide[i];
+			}
+		}
+		wire[out++] = 0;
+		free(wide);
+		if (out != wire_units)
+			goto error_return;
 #else
-		data_size = MultiByteToWideChar(CP_UTF8, 0,
-						data,
-						source->data_contents.size,
-						NULL, 0);
-#endif
+		data_size = MultiByteToWideChar(CP_UTF8, 0, data,
+						source->data_contents.size, NULL, 0);
 		if (data_size < 1)
 			goto error_return;
-
-		data_size *= 2; /* convert to size in bytes. */
+		data_size *= 2;
 		if (!wl_array_add(&data_contents, data_size))
 			goto error_return;
-
-		/* convert to UNICODE */
-#if FREERDP_VERSION_MAJOR >= 3
-		data_size_in_char = ConvertUtf8NToWChar(data,
-							source->data_contents.size,
-							data_contents.data,
-							data_size);
-#else
-		data_size_in_char = MultiByteToWideChar(CP_UTF8, 0,
-							data,
-							source->data_contents.size,
-							data_contents.data,
-							data_size);
-#endif
+		data_size_in_char = MultiByteToWideChar(CP_UTF8, 0, data,
+						source->data_contents.size,
+						data_contents.data, data_size);
 		assert(data_contents.size == (size_t)(data_size_in_char * 2));
+#endif
 	} else {
 		/* Windows to Linux (UNICODE to utf-8) */
 		LPWSTR data = source->data_contents.data;
@@ -252,7 +273,7 @@ clipboard_process_text_utf8(struct rdp_clipboard_data_source *source, bool is_se
 
 		/* Windows's data has trailing chars, which Linux doesn't expect. */
 		while (data_size_in_char &&
-		       ((data[data_size_in_char-1] == L'\0') || (data[data_size_in_char-1] == L'\n')))
+		       (data[data_size_in_char-1] == L'\0'))
 			data_size_in_char -= 1;
 		if (!data_size_in_char)
 			goto error_return;
@@ -291,6 +312,10 @@ clipboard_process_text_utf8(struct rdp_clipboard_data_source *source, bool is_se
 #endif
 		if (data_contents.size != (size_t)data_size)
 			goto error_return;
+#if FREERDP_VERSION_MAJOR >= 3
+		data_contents.size = ConvertLineEndingToLF(data_contents.data,
+							data_contents.size);
+#endif
 	}
 
 	/* swap the data_contents with new one */
@@ -840,7 +865,9 @@ clipboard_client_send_format_data_response(RdpPeerContext *ctx, struct rdp_clipb
 	CLIP_MSG_HEADER(formatDataResponse, msgFlags) = CB_RESPONSE_OK;
 	CLIP_MSG_HEADER(formatDataResponse, dataLen) = source->processed_data_size;
 	formatDataResponse.requestedFormatData = source->processed_data_start;
-	ctx->clipboard_server_context->ServerFormatDataResponse(ctx->clipboard_server_context, &formatDataResponse);
+	UINT status = ctx->clipboard_server_context->ServerFormatDataResponse(ctx->clipboard_server_context, &formatDataResponse);
+	rdp_debug_clipboard(b, "Client: clipboard_response_queued status:%u bytes:%u\n",
+			    status, source->processed_data_size);
 	/* if here failed to send response, what can we do ? */
 }
 
