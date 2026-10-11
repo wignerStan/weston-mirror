@@ -1247,6 +1247,16 @@ xf_peer_activate(freerdp_peer* client)
 		if (rdp_clipboard_init(client) != 0)
 			goto error_exit;
 
+	if (!(peersItem->flags & RDP_PEER_ACTIVATED) &&
+	    !freerdp_settings_get_bool(settings, FreeRDP_HiDefRemoteApp)) {
+		const char *codec =
+			freerdp_settings_get_bool(settings, FreeRDP_RemoteFxCodec) ? "RemoteFX" :
+			freerdp_settings_get_bool(settings, FreeRDP_NSCodec) ? "NSCodec" : "raw";
+		weston_log("RDP desktop codec selected: %s; encoder=software; width=%u height=%u\n",
+			   codec,
+			   freerdp_settings_get_uint32(settings, FreeRDP_DesktopWidth),
+			   freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight));
+	}
 	peersItem->flags |= RDP_PEER_ACTIVATED;
 
 	if (!freerdp_settings_get_bool(settings, FreeRDP_HiDefRemoteApp) && output) {
