@@ -1066,6 +1066,146 @@ convert_rdp_keyboard_to_xkb_rule_names(
 		xkbRuleNames->model, xkbRuleNames->layout, xkbRuleNames->variant, xkbRuleNames->options);
 }
 
+/* Ordinary desktops use the maintained DISP channel, without RAIL/GFX. */
+struct rdp_desktop_layout_task {
+	struct rdp_loop_task base;
+	rdpMonitor monitor;
+};
+
+static bool
+rdp_desktop_layout_valid(const DISPLAY_CONTROL_MONITOR_LAYOUT_PDU *layout)
+{
+	const DISPLAY_CONTROL_MONITOR_LAYOUT *m;
+
+	if (!layout || layout->MonitorLayoutSize != DISPLAY_CONTROL_MONITOR_LAYOUT_SIZE ||
+	    layout->NumMonitors != 1 || !layout->Monitors)
+		return false;
+
+	m = layout->Monitors;
+	if (m->Flags != DISPLAY_CONTROL_MONITOR_PRIMARY || m->Left != 0 || m->Top != 0 ||
+	    m->Width < DISPLAY_CONTROL_MIN_MONITOR_WIDTH ||
+	    m->Width > DISPLAY_CONTROL_MAX_MONITOR_WIDTH ||
+	    m->Height < DISPLAY_CONTROL_MIN_MONITOR_HEIGHT ||
+	    m->Height > DISPLAY_CONTROL_MAX_MONITOR_HEIGHT)
+		return false;
+
+	if (m->Orientation != ORIENTATION_LANDSCAPE &&
+	    m->Orientation != ORIENTATION_PORTRAIT &&
+	    m->Orientation != ORIENTATION_LANDSCAPE_FLIPPED &&
+	    m->Orientation != ORIENTATION_PORTRAIT_FLIPPED)
+		return false;
+
+	/* Zero means unspecified; otherwise reject values that produce no scale. */
+	if (m->DesktopScaleFactor != 0 &&
+	    (m->DesktopScaleFactor < 100 || m->DesktopScaleFactor > 500))
+		return false;
+	if (m->DeviceScaleFactor != 0 && m->DeviceScaleFactor != 100 &&
+	    m->DeviceScaleFactor != 140 && m->DeviceScaleFactor != 180)
+		return false;
+
+	return true;
+}
+
+static void
+rdp_desktop_layout_apply(bool free_only, void *arg)
+{
+	struct rdp_desktop_layout_task *task = wl_container_of(arg, task, base);
+	RdpPeerContext *peer_ctx;
+	struct rdp_backend *b;
+	struct rdp_output *output;
+
+	/* Teardown closes DISP before it drains tasks. Do not access its context. */
+	if (free_only)
+		goto out;
+
+	peer_ctx = task->base.peerCtx;
+	b = peer_ctx->rdpBackend;
+	assert_compositor_thread(b);
+	if (!(peer_ctx->item.flags & RDP_PEER_ACTIVATED) || b->no_clients_resize ||
+	    freerdp_settings_get_bool(peer_ctx->item.peer->context->settings,
+				     FreeRDP_RemoteApplicationMode))
+		goto out;
+
+	/* The existing output mode change sends DesktopResize through FreeRDP. */
+	if (!handle_adjust_monitor_layout(peer_ctx->item.peer, 1, &task->monitor))
+		goto out;
+
+	output = rdp_get_first_output(b);
+	if (!output || !output->base.current_mode)
+		goto out;
+	rfx_context_reset(peer_ctx->rfx_context, output->base.current_mode->width,
+			  output->base.current_mode->height);
+	nsc_context_reset(peer_ctx->nsc_context, output->base.current_mode->width,
+			  output->base.current_mode->height);
+	weston_compositor_damage_all(b->compositor);
+	weston_log("RDP desktop resize applied: width=%d height=%d\n",
+		   output->base.current_mode->width, output->base.current_mode->height);
+out:
+	free(task);
+}
+
+static unsigned int
+rdp_desktop_layout_received(DispServerContext *context,
+			    const DISPLAY_CONTROL_MONITOR_LAYOUT_PDU *layout)
+{
+	freerdp_peer *peer = context->custom;
+	RdpPeerContext *peer_ctx = (RdpPeerContext *)peer->context;
+	struct rdp_backend *b = peer_ctx->rdpBackend;
+	struct rdp_desktop_layout_task *task;
+	const DISPLAY_CONTROL_MONITOR_LAYOUT *m;
+
+	assert_not_compositor_thread(b);
+	if (!rdp_desktop_layout_valid(layout))
+		return ERROR_INVALID_DATA;
+	if (b->no_clients_resize)
+		return CHANNEL_RC_OK;
+	if (freerdp_settings_get_bool(peer->context->settings, FreeRDP_RemoteApplicationMode))
+		return ERROR_INVALID_DATA;
+
+	task = zalloc(sizeof(*task));
+	if (!task)
+		return CHANNEL_RC_NO_MEMORY;
+	m = layout->Monitors;
+	task->monitor.x = m->Left;
+	task->monitor.y = m->Top;
+	task->monitor.width = m->Width;
+	task->monitor.height = m->Height;
+	task->monitor.is_primary = true;
+	task->monitor.attributes.physicalWidth = m->PhysicalWidth;
+	task->monitor.attributes.physicalHeight = m->PhysicalHeight;
+	task->monitor.attributes.orientation = m->Orientation;
+	task->monitor.attributes.desktopScaleFactor = m->DesktopScaleFactor;
+	task->monitor.attributes.deviceScaleFactor = m->DeviceScaleFactor;
+
+	/* The PDU belongs to FreeRDP and expires on return; keep our own snapshot. */
+	rdp_dispatch_task_to_display_loop(peer_ctx, rdp_desktop_layout_apply, &task->base);
+	return CHANNEL_RC_OK;
+}
+
+static bool
+rdp_desktop_disp_init(freerdp_peer *peer)
+{
+	RdpPeerContext *peer_ctx = (RdpPeerContext *)peer->context;
+	DispServerContext *disp = disp_server_context_new(peer_ctx->vcm);
+
+	if (!disp)
+		return false;
+	disp->custom = peer;
+	disp->MaxNumMonitors = 1;
+	disp->MaxMonitorAreaFactorA = DISPLAY_CONTROL_MAX_MONITOR_WIDTH;
+	disp->MaxMonitorAreaFactorB = DISPLAY_CONTROL_MAX_MONITOR_HEIGHT;
+	disp->DispMonitorLayout = rdp_desktop_layout_received;
+	if (disp->Open(disp) != CHANNEL_RC_OK ||
+	    disp->DisplayControlCaps(disp) != CHANNEL_RC_OK) {
+		disp_server_context_free(disp);
+		return false;
+	}
+
+	/* The common peer teardown already closes and frees this context. */
+	peer_ctx->disp_server_context = disp;
+	return true;
+}
+
 static BOOL
 xf_peer_activate(freerdp_peer* client)
 {
@@ -1082,6 +1222,7 @@ xf_peer_activate(freerdp_peer* client)
 	pixman_region32_t damage;
 	char seat_name[50];
 	POINTER_SYSTEM_UPDATE pointer_system;
+	bool desktop_disp_requested;
 
 	peerCtx = (RdpPeerContext *)client->context;
 	b = peerCtx->rdpBackend;
@@ -1130,10 +1271,21 @@ xf_peer_activate(freerdp_peer* client)
 	(void)freerdp_settings_set_bool(settings, FreeRDP_AudioPlayback, b->audio_out_setup && b->audio_out_teardown);
 	(void)freerdp_settings_set_bool(settings, FreeRDP_AudioCapture, b->audio_in_setup && b->audio_in_teardown);
 
-	if (freerdp_settings_get_bool(settings, FreeRDP_RemoteApplicationMode) ||
-		freerdp_settings_get_bool(settings, FreeRDP_RedirectClipboard) ||
-		freerdp_settings_get_bool(settings, FreeRDP_AudioPlayback) ||
-		freerdp_settings_get_bool(settings, FreeRDP_AudioCapture)) {
+	/* DesktopResize alone does not mean that a legacy peer has drdynvc. */
+	desktop_disp_requested =
+		!freerdp_settings_get_bool(settings, FreeRDP_RemoteApplicationMode) &&
+		!b->no_clients_resize &&
+		freerdp_settings_get_bool(settings, FreeRDP_DesktopResize) &&
+		peerCtx->vcm &&
+		WTSVirtualChannelManagerIsChannelJoined(peerCtx->vcm, "drdynvc");
+
+	/* DesktopResize reactivates the peer, but its channel contexts stay alive. */
+	if (!(peersItem->flags & RDP_PEER_ACTIVATED) &&
+	    (freerdp_settings_get_bool(settings, FreeRDP_RemoteApplicationMode) ||
+	     freerdp_settings_get_bool(settings, FreeRDP_RedirectClipboard) ||
+	     freerdp_settings_get_bool(settings, FreeRDP_AudioPlayback) ||
+	     freerdp_settings_get_bool(settings, FreeRDP_AudioCapture) ||
+	     desktop_disp_requested)) {
 
 		if (!peerCtx->vcm) {
 			rdp_debug_error(b, "Virtual channel is required for RAIL, clipboard, audio playback/capture\n");
@@ -1144,9 +1296,13 @@ xf_peer_activate(freerdp_peer* client)
 		if (!rdp_drdynvc_init(client))
 			goto error_exit;
 
-		if (freerdp_settings_get_bool(settings, FreeRDP_RemoteApplicationMode))
+		if (freerdp_settings_get_bool(settings, FreeRDP_RemoteApplicationMode)) {
 			if (!rdp_rail_peer_activate(client))
 				goto error_exit;
+		} else if (desktop_disp_requested) {
+			if (!rdp_desktop_disp_init(client))
+				goto error_exit;
+		}
 
 		/* Audio setup will return NULL on failure, and we'll proceed without audio */
 		if (freerdp_settings_get_bool(settings, FreeRDP_AudioPlayback))
