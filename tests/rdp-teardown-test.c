@@ -37,6 +37,40 @@ ZUC_TEST(rdp_teardown, activation_error_cleanup)
 }
 
 #if FREERDP_VERSION_MAJOR >= 3
+static unsigned int test_peer_fd_checks;
+
+static BOOL
+test_peer_check_fd(freerdp_peer *client)
+{
+	(void)client;
+	test_peer_fd_checks++;
+	return TRUE;
+}
+
+ZUC_TEST(rdp_channels, licensing_does_not_pump_vcm)
+{
+	struct rdp_backend backend = { 0 };
+	RdpPeerContext context = { 0 };
+	freerdp_peer peer = { 0 };
+
+	context.rdpBackend = &backend;
+	/* This sentinel must never reach the FreeRDP VCM before activation. */
+	context.vcm = (HANDLE)(uintptr_t)1;
+	peer.context = (rdpContext *)&context;
+	peer.CheckFileDescriptor = test_peer_check_fd;
+	peer.activated = FALSE;
+	test_peer_fd_checks = 0;
+
+	ZUC_ASSERT_EQ(0, rdp_client_activity(-1, WL_EVENT_READABLE, &peer));
+	ZUC_ASSERT_EQ(1, test_peer_fd_checks);
+
+	/* The peer transport is still pumped when VCM is absent. */
+	context.vcm = NULL;
+	peer.activated = TRUE;
+	ZUC_ASSERT_EQ(0, rdp_client_activity(-1, WL_EVENT_READABLE, &peer));
+	ZUC_ASSERT_EQ(2, test_peer_fd_checks);
+}
+
 static int
 test_log_handler(const char *fmt, va_list ap)
 {

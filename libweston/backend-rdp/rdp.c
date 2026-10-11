@@ -847,8 +847,10 @@ rdp_client_activity(int fd, uint32_t mask, void *data)
 	if (peerCtx && peerCtx->vcm)
 	{
 #if FREERDP_VERSION_MAJOR >= 3
-		/* FreeRDP 3 asserts on calling CheckFileDescriptor before drdynvc joined */
-		if (!WTSVirtualChannelManagerIsChannelJoined(peerCtx->vcm, "drdynvc"))
+		/* FreeRDP 3 joins channels before licensing finishes. Do not emit
+		 * drdynvc capabilities until the peer has completed activation. */
+		if (!client->activated ||
+		    !WTSVirtualChannelManagerIsChannelJoined(peerCtx->vcm, "drdynvc"))
 			return 0;
 #endif
 		if (!WTSVirtualChannelManagerCheckFileDescriptor(peerCtx->vcm)) {
