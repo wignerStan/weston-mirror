@@ -662,6 +662,18 @@ rdp_audio_client_activated(RdpsndServerContext* context)
 			weston_log("RDPAudio - SelectFormat failed; audio output disabled.\n");
 			return;
 		}
+		/* Log only negotiated metadata, once when this audio channel activates. */
+		const AUDIO_FORMAT *src = context->src_format;
+		const AUDIO_FORMAT *selected = &context->client_formats[format];
+		weston_log("RDPAudio source format: tag=%u channels=%u rate=%u avg_bytes=%u block_align=%u bits=%u\n",
+			   (unsigned)src->wFormatTag, (unsigned)src->nChannels,
+			   src->nSamplesPerSec, src->nAvgBytesPerSec,
+			   (unsigned)src->nBlockAlign, (unsigned)src->wBitsPerSample);
+		weston_log("RDPAudio selected client format: index=%d tag=%u channels=%u rate=%u avg_bytes=%u block_align=%u bits=%u bytes_per_frame=%d\n",
+			   format, (unsigned)selected->wFormatTag, (unsigned)selected->nChannels,
+			   selected->nSamplesPerSec, selected->nAvgBytesPerSec,
+			   (unsigned)selected->nBlockAlign, (unsigned)selected->wBitsPerSample,
+			   priv->bytesPerFrame);
 		(void)context->SetVolume(context, 0x7FFF, 0x7FFF);
 
 		priv->pulseAudioSinkListenerFd = rdp_audio_setup_listener();
