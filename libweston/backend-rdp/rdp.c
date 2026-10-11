@@ -1831,6 +1831,42 @@ is_tls_enabled(struct rdp_backend *b)
 	return (b->server_cert && b->server_key) || using_session_tls(b);
 }
 
+#if FREERDP_VERSION_MAJOR >= 3
+static BOOL
+rdp_peer_nla_logon(freerdp_peer *client,
+		   const SEC_WINNT_AUTH_IDENTITY *identity, BOOL automatic)
+{
+	(void)client;
+	(void)identity;
+	/* FreeRDP calls this only after CredSSP has validated the SAM identity.
+	 * Anonymous TLS/RDP tunnels must not enter the single-user desktop. */
+	if (!automatic)
+		return FALSE;
+
+	weston_log("RDP peer authenticated with CredSSP/NLA\n");
+	return TRUE;
+}
+
+static BOOL
+rdp_peer_configure_nla(freerdp_peer *client, const char *sam_file)
+{
+	rdpSettings *settings = client->context->settings;
+
+	if (!sam_file || !*sam_file)
+		return TRUE;
+
+	if (!freerdp_settings_set_string(settings, FreeRDP_NtlmSamFile, sam_file) ||
+	    !freerdp_settings_set_bool(settings, FreeRDP_NlaSecurity, TRUE) ||
+	    !freerdp_settings_set_bool(settings, FreeRDP_TlsSecurity, FALSE) ||
+	    !freerdp_settings_set_bool(settings, FreeRDP_RdpSecurity, FALSE) ||
+	    !freerdp_settings_set_bool(settings, FreeRDP_Authentication, TRUE))
+		return FALSE;
+
+	client->Logon = rdp_peer_nla_logon;
+	return TRUE;
+}
+#endif
+
 static int
 rdp_peer_init(freerdp_peer *client, struct rdp_backend *b)
 {
@@ -1896,6 +1932,13 @@ rdp_peer_init(freerdp_peer *client, struct rdp_backend *b)
 		(void)freerdp_settings_set_bool(settings, FreeRDP_TlsSecurity, FALSE);
 	}
 	(void)freerdp_settings_set_bool(settings, FreeRDP_NlaSecurity, FALSE);
+#endif
+
+#if FREERDP_VERSION_MAJOR >= 3
+	/* Optional for existing WSLg users; network desktop deployments require
+	 * this secret and a TLS certificate before starting the listener. */
+	if (!rdp_peer_configure_nla(client, getenv("WESTON_RDP_NLA_SAM_FILE")))
+		goto error_initialize;
 #endif
 
 	if (!client->Initialize(client)) {
