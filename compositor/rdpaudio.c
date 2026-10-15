@@ -674,7 +674,7 @@ rdp_audio_client_activated(RdpsndServerContext* context)
 			   selected->nSamplesPerSec, selected->nAvgBytesPerSec,
 			   (unsigned)selected->nBlockAlign, (unsigned)selected->wBitsPerSample,
 			   priv->bytesPerFrame);
-		(void)context->SetVolume(context, 0x7FFF, 0x7FFF);
+		/* Preserve the client-selected volume on connection. */
 
 		priv->pulseAudioSinkListenerFd = rdp_audio_setup_listener();
 		if (priv->pulseAudioSinkListenerFd < 0) {
