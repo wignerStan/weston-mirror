@@ -598,8 +598,14 @@ clipboard_process_bmp(struct rdp_clipboard_data_source *source, bool is_send)
 	assert(!source->is_data_processed);
 
 	wl_array_init(&data_contents);
-	if (is_send && source->png_to_dib)
-		return clipboard_png_to_dib(source);
+	if (source->png_to_dib) {
+		if (!clipboard_png_to_dib(source))
+			return false;
+		if (is_send)
+			return true;
+		/* Incoming PNG is now DIB; add the normal BMP file header below. */
+		source->is_data_processed = false;
+	}
 
 	if (is_send) {
 		/* Linux to Windows (remove BITMAPFILEHEADER) */
@@ -1317,6 +1323,15 @@ clipboard_data_source_send(struct weston_data_source *base,
 			CLIP_MSG_HEADER(formatDataRequest, msgType) = CB_FORMAT_DATA_REQUEST;
 			CLIP_MSG_HEADER(formatDataRequest, dataLen) = 4;
 			formatDataRequest.requestedFormatId = source->client_format_id_table[index];
+			source->png_to_dib = false;
+			if (clipboard_supported_formats[index].format_id == CF_DIB) {
+				int png_index = clipboard_find_supported_format_by_mime_type("image/png");
+				/* Windows App preserves RGB in PNG but color-converts its DIB offer. */
+				if (png_index >= 0 && source->client_format_id_table[png_index]) {
+					source->png_to_dib = true;
+					formatDataRequest.requestedFormatId = source->client_format_id_table[png_index];
+				}
+			}
 			source->state = RDP_CLIPBOARD_SOURCE_REQUEST_DATA;
 			rdp_debug_clipboard(b, "RDP %s (%p:%s) request data \"%s\" index:%d formatId:%d %s\n",
 					    __func__, source, clipboard_data_source_state_to_string(source), mime_type, index,
