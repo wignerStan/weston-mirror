@@ -347,8 +347,13 @@ rdp_audio_client_confirm_block(
 {
 	struct audio_out_private *priv = context->data;
 
+	/* Confirmations are untrusted channel input. Ignore unknown or repeated
+	 * blocks; never abort the compositor or release a second buffer credit. */
+	if (priv->blockInfo[confirmBlockNum].submissionTime == 0 ||
+	    priv->blockInfo[confirmBlockNum].ackPlayedTime != 0)
+		return 0;
+
 	if (priv->blockInfo[confirmBlockNum].ackReceivedTime != 0) {
-		assert(priv->blockInfo[confirmBlockNum].ackPlayedTime == 0);
 		priv->blockInfo[confirmBlockNum].ackPlayedTime = rdp_audio_timestamp();
 
 		/* 
