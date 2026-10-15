@@ -45,7 +45,9 @@ if cc.has_member(
 	config_h.set('HAVE_RDPSND_DYNAMIC_VIRTUAL_CHANNEL', '1')
 endif
 
+dep_png_rdp = dependency("libpng", version: ">= 1.6.0")
 deps_rdp = [
+	dep_png_rdp,
 	dep_threads,
 	dep_libdl,
 	dep_libweston_private,

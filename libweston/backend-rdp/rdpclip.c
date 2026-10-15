@@ -34,6 +34,7 @@
 #include <fcntl.h>
 #include <linux/input.h>
 #include <stdio.h>
+#include <png.h>
 #include <winpr/string.h>
 
 #include "rdp.h"
@@ -52,6 +53,7 @@
 
 /* From MSDN, RegisterClipboardFormat API.
    Registered clipboard formats are identified by values in the range 0xC000 through 0xFFFF. */
+#define CF_PRIVATE_PNG  49406 /* Registered format name: PNG. */
 #define CF_PRIVATE_RTF  49309 /* fake format ID for "Rich Text Format". */
 #define CF_PRIVATE_HTML 49405 /* fake format ID for "HTML Format".*/
 
@@ -89,6 +91,8 @@ static bool
 clipboard_process_text_raw(struct rdp_clipboard_data_source *source, bool is_send);
 
 static bool
+clipboard_process_png(struct rdp_clipboard_data_source *source, bool is_send);
+static bool
 clipboard_process_bmp(struct rdp_clipboard_data_source *source , bool is_send);
 
 static bool
@@ -100,6 +104,7 @@ clipboard_process_html(struct rdp_clipboard_data_source *source, bool is_send);
 struct rdp_clipboard_supported_format clipboard_supported_formats[] = {
 	{ CF_UNICODETEXT,  NULL,               "text/plain;charset=utf-8", clipboard_process_text_utf8 },
 	{ CF_TEXT,         NULL,               "STRING",                   clipboard_process_text_raw  },
+	{ CF_PRIVATE_PNG, "PNG",              "image/png",                clipboard_process_png       },
 	{ CF_DIB,          NULL,               "image/bmp",                clipboard_process_bmp       },
 	{ CF_PRIVATE_RTF,  "Rich Text Format", "text/rtf",                 clipboard_process_text_raw  },
 	{ CF_PRIVATE_HTML, "HTML Format",      "text/html",                clipboard_process_html      },
@@ -138,6 +143,7 @@ struct rdp_clipboard_data_source {
 	void *processed_data_start;
 	uint32_t processed_data_size;
 	bool processed_data_is_send;
+	bool png_to_dib;
 	bool is_canceled;
 	uint32_t client_format_id_table[RDP_NUM_CLIPBOARD_FORMATS];
 };
@@ -507,6 +513,74 @@ error_return:
 	return false;
 }
 
+/* PNG is already encoded. Preserve every byte, including trailing zero bytes. */
+static bool
+clipboard_process_png(struct rdp_clipboard_data_source *source, bool is_send)
+{
+	static const unsigned char signature[] = {137, 80, 78, 71, 13, 10, 26, 10};
+	(void)is_send;
+	assert(!source->is_data_processed);
+	if (source->data_contents.size < sizeof(signature) ||
+	    memcmp(source->data_contents.data, signature, sizeof(signature)) != 0) {
+		source->state = RDP_CLIPBOARD_SOURCE_FAILED;
+		return false;
+	}
+	source->is_data_processed = true;
+	source->processed_data_start = source->data_contents.data;
+	source->processed_data_size = source->data_contents.size;
+	return true;
+}
+
+/* Use libpng for PNG decoding; only the standard DIB row layout is adapted. */
+static bool
+clipboard_png_to_dib(struct rdp_clipboard_data_source *source)
+{
+ png_image image = { .version = PNG_IMAGE_VERSION };
+ png_color background = { 255, 255, 255 };
+ struct wl_array output;
+ BITMAPINFOHEADER *header;
+ size_t stride, bytes;
+ bool ok = false;
+ wl_array_init(&output);
+ if (!png_image_begin_read_from_memory(&image, source->data_contents.data,
+                                      source->data_contents.size))
+  goto out;
+ /* Bound decoded allocation before libpng expands an untrusted image. */
+ if (!image.width || !image.height || image.width > 16384 || image.height > 16384)
+  goto out;
+ stride = ((size_t)image.width * 3 + 3) & ~(size_t)3;
+ bytes = stride * image.height;
+ if (bytes > 64 * 1024 * 1024 ||
+     !wl_array_add(&output, sizeof(*header) + bytes))
+  goto out;
+ memset(output.data, 0, output.size);
+ header = output.data;
+ header->biSize = sizeof(*header);
+ header->biWidth = image.width;
+ header->biHeight = image.height;
+ header->biPlanes = 1;
+ header->biBitCount = 24;
+ header->biCompression = BI_RGB;
+ header->biSizeImage = bytes;
+ image.format = PNG_FORMAT_BGR;
+ if (!png_image_finish_read(&image, &background, header + 1,
+                            -(png_int_32)stride, NULL))
+  goto out;
+ wl_array_release(&source->data_contents);
+ source->data_contents = output;
+ wl_array_init(&output);
+ source->is_data_processed = true;
+ source->processed_data_start = source->data_contents.data;
+ source->processed_data_size = source->data_contents.size;
+ ok = true;
+out:
+ png_image_free(&image);
+ wl_array_release(&output);
+ if (!ok)
+  source->state = RDP_CLIPBOARD_SOURCE_FAILED;
+ return ok;
+}
+
 #define DIB_HEADER_MARKER     ((WORD) ('M' << 8) | 'B')
 #define DIB_WIDTH_BYTES(bits) ((((bits) + 31) & ~31) >> 3)
 
@@ -524,6 +598,8 @@ clipboard_process_bmp(struct rdp_clipboard_data_source *source, bool is_send)
 	assert(!source->is_data_processed);
 
 	wl_array_init(&data_contents);
+	if (is_send && source->png_to_dib)
+		return clipboard_png_to_dib(source);
 
 	if (is_send) {
 		/* Linux to Windows (remove BITMAPFILEHEADER) */
@@ -1253,7 +1329,7 @@ clipboard_data_source_send(struct weston_data_source *base,
 		source->state = RDP_CLIPBOARD_SOURCE_FAILED;
 		weston_log("RDP %s (%p:%s) specified format \"%s\" index:%d formatId:%d is not supported by client\n",
 			   __func__, source, clipboard_data_source_state_to_string(source),
-			   mime_type, index, source->client_format_id_table[index]);
+			   mime_type, index, index >= 0 ? source->client_format_id_table[index] : 0);
 		goto error_return_close_fd;
 	}
 
@@ -1374,6 +1450,7 @@ clipboard_data_source_request(bool freeOnly, void *arg)
 	const char *requested_mime_type, **mime_type;
 	int index;
 	bool found_requested_format;
+	bool png_to_dib = false;
 	bool ret;
 
 	assert_compositor_thread(b);
@@ -1396,6 +1473,16 @@ clipboard_data_source_request(bool freeOnly, void *arg)
 			break;
 		}
 	}
+	if (!found_requested_format && clipboard_supported_formats[index].format_id == CF_DIB) {
+  wl_array_for_each(mime_type, &selection_data_source->mime_types) {
+   if (strcmp(*mime_type, "image/png") == 0) {
+    requested_mime_type = "image/png";
+    found_requested_format = true;
+    png_to_dib = true;
+    break;
+   }
+  }
+ }
 	if (!found_requested_format) {
 		rdp_debug_clipboard(b, "RDP %s (base:%p) requested format not found format:\"%s\"\n",
 				    __func__, selection_data_source, requested_mime_type);
@@ -1421,6 +1508,7 @@ clipboard_data_source_request(bool freeOnly, void *arg)
 	source->refcount = 1; /* decremented when data sent to client. */
 	source->data_source_fd = -1;
 	source->format_index = index;
+	source->png_to_dib = png_to_dib;
 
 	if (pipe2(p, O_CLOEXEC) == -1)
 		goto error_exit_free_source;
@@ -1507,25 +1595,23 @@ clipboard_set_selection(struct wl_listener *listener, void *data)
 		num_avail_format++;
 	}
 
-	/* check supported clipboard formats */
-	wl_array_for_each(mime_type, &selection_data_source->mime_types) {
-		index = clipboard_find_supported_format_by_mime_type(*mime_type);
-		if (index >= 0) {
-			CLIPRDR_FORMAT *f = &format[num_supported_format];
-
-			f->formatId = clipboard_supported_formats[index].format_id;
-			f->formatName = clipboard_supported_formats[index].format_name;
-			rdp_debug_clipboard(b, "RDP %s (base:%p) supported formats[%d]: %d: %s\n",
-					    __func__,
-					    selection_data_source,
-					    num_supported_format,
-					    f->formatId,
-					    f->formatName ?
-					    f->formatName :
-					    clipboard_format_id_to_string(f->formatId, true));
-			num_supported_format++;
-		}
-	}
+ /* Build each wire format once, including DIB fallback for PNG-only offers. */
+ for (index = 0; index < (int)RDP_NUM_CLIPBOARD_FORMATS; index++) {
+  bool available = false;
+  wl_array_for_each(mime_type, &selection_data_source->mime_types) {
+   if (strcmp(*mime_type, clipboard_supported_formats[index].mime_type) == 0 ||
+       (clipboard_supported_formats[index].format_id == CF_DIB &&
+        strcmp(*mime_type, "image/png") == 0)) {
+    available = true;
+    break;
+   }
+  }
+  if (available) {
+   format[num_supported_format].formatId = clipboard_supported_formats[index].format_id;
+   format[num_supported_format].formatName = clipboard_supported_formats[index].format_name;
+   num_supported_format++;
+  }
+ }
 
 	if (num_supported_format) {
 		/* let client knows formats are available in server clipboard */
